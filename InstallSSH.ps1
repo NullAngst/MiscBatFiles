@@ -1,37 +1,64 @@
 #Requires -RunAsAdministrator
 
-# Check if OpenSSH Server is already installed
-$existing = Get-WindowsCapability -Online | Where-Object { $_.Name -like "OpenSSH.Server*" }
-if ($existing.State -eq "Installed") {
-    Write-Host "OpenSSH Server is already installed on this system. No changes made." -ForegroundColor Yellow
-    exit 0
-}
+# Internal name of the rule the OpenSSH.Server capability creates on install.
+# Matching on Name (not DisplayName) is locale independent and avoids duplicates.
+$ruleName        = "OpenSSH-Server-In-TCP"
+$ruleDisplayName = "OpenSSH Server (sshd)"   # Display name used by earlier versions of this script
+$restartNeeded   = $false
 
 try {
-    # Install OpenSSH Server using the capability name resolved at runtime
-    Write-Host "Installing OpenSSH Server..."
-    Add-WindowsCapability -Online -Name $existing.Name -ErrorAction Stop
+    $capability = Get-WindowsCapability -Online -ErrorAction Stop |
+        Where-Object { $_.Name -like "OpenSSH.Server*" } |
+        Select-Object -First 1
 
-    # Set service to start automatically and start it now
+    if (-not $capability) {
+        throw "No OpenSSH.Server capability is available on this system."
+    }
+
+    if ($capability.State -eq "Installed") {
+        Write-Host "OpenSSH Server is already installed. Verifying service and firewall configuration..." -ForegroundColor Yellow
+    } else {
+        # Install using the capability name resolved at runtime
+        Write-Host "Installing $($capability.Name)..."
+        $result = Add-WindowsCapability -Online -Name $capability.Name -ErrorAction Stop
+        if ($result.RestartNeeded) { $restartNeeded = $true }
+    }
+
     Write-Host "Configuring OpenSSH Server to start automatically on boot..."
     Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
 
-    Write-Host "Starting the OpenSSH Server service..."
-    Start-Service -Name sshd -ErrorAction Stop
-
-    # Add firewall rule if one does not already exist
-    Write-Host "Checking Windows Firewall for TCP port 22..."
-    $ruleName = "OpenSSH Server (sshd)"
-    $ruleExists = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-    if ($ruleExists) {
-        Write-Host "Firewall rule already exists. Skipping." -ForegroundColor Yellow
+    $service = Get-Service -Name sshd -ErrorAction Stop
+    if ($service.Status -eq "Running") {
+        Write-Host "The sshd service is already running."
     } else {
-        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -ErrorAction Stop | Out-Null
+        Write-Host "Starting the OpenSSH Server service..."
+        Start-Service -Name sshd -ErrorAction Stop
+    }
+
+    Write-Host "Checking Windows Firewall for TCP port 22..."
+    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    if (-not $rule) {
+        $rule = Get-NetFirewallRule -DisplayName $ruleDisplayName -ErrorAction SilentlyContinue
+    }
+
+    if ($rule) {
+        if ($rule | Where-Object { $_.Enabled -ne "True" }) {
+            $rule | Enable-NetFirewallRule -ErrorAction Stop
+            Write-Host "Existing firewall rule was disabled. Enabled it."
+        } else {
+            Write-Host "Firewall rule already exists. Skipping." -ForegroundColor Yellow
+        }
+    } else {
+        New-NetFirewallRule -Name $ruleName -DisplayName $ruleDisplayName -Enabled True `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -ErrorAction Stop | Out-Null
         Write-Host "Firewall rule added for TCP port 22."
     }
 
     Write-Host ""
-    Write-Host "Success. OpenSSH Server is installed, running, and accepting connections." -ForegroundColor Green
+    Write-Host "Success. OpenSSH Server is installed and running, and inbound TCP 22 is allowed." -ForegroundColor Green
+    if ($restartNeeded) {
+        Write-Host "A reboot is required to complete the installation." -ForegroundColor Yellow
+    }
 
 } catch {
     Write-Host ""
